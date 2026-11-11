@@ -57,3 +57,4 @@ litellm/rust_bridge/_native*.so
 .env
 .env.local
 enterprise/
+litellm/proxy/enterprise
