@@ -56,3 +56,4 @@ litellm/rust_bridge/_native*.so
 *.log
 .env
 .env.local
+enterprise/
