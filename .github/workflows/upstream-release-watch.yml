@@ -1,0 +1,116 @@
+name: Upstream release watch
+
+on:
+  schedule:
+    - cron: "37 5 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print the issues to the job summary instead of opening them
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - ".github/workflows/upstream-release-watch.yml"
+      - ".github/scripts/upstream_release_watch.py"
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  UPSTREAM: BerriAI/litellm
+  DRY_RUN: ${{ github.event_name == 'pull_request' || inputs.dry_run == true }}
+  MODEL_NAME: Gemma 4 E4B
+  LLAMA_CPP_BUILD: b12110
+
+jobs:
+  watch:
+    name: watch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      issues: write
+      actions: write
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Keep every other workflow switched off
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100" \
+            --jq '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/")) and .path != ".github/workflows/upstream-release-watch.yml") | "\(.id) \(.path)"' |
+            while read -r id path; do
+              echo "Disabling $path"
+              gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable" ||
+                echo "::warning::could not disable $path"
+            done
+
+      - name: Find upstream releases without an issue
+        id: pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then extra=(--ignore-existing-issues); else extra=(); fi
+          versions=$(python3 .github/scripts/upstream_release_watch.py pending \
+            --upstream "$UPSTREAM" --repo "$GITHUB_REPOSITORY" "${extra[@]}")
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+          echo "Releases to report: $versions"
+
+      - name: Download llama.cpp v0.9.0
+        if: steps.pending.outputs.versions != '[]'
+        continue-on-error: true
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/llama.tar.gz" \
+            "https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_CPP_BUILD/llama-$LLAMA_CPP_BUILD-bin-ubuntu-x64.tar.gz"
+          echo "368227edcc229be5f9bed16a2223d79b5e41d0ac2e19bcf5825e82291c060e55  $RUNNER_TEMP/llama.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/llama.tar.gz" -C "$RUNNER_TEMP"
+
+      - name: Download the Gemma 4 E4B model
+        if: steps.pending.outputs.versions != '[]'
+        continue-on-error: true
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/model.gguf" \
+            https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/8903cb408c7df39cde2ed15fac397e6d7be92951/gemma-4-E4B-it-Q4_0.gguf
+          echo "a555b900214b477d8880e7832e0b8925e139b0159640036b09fe472b6f2097f2  $RUNNER_TEMP/model.gguf" | sha256sum -c -
+
+      - name: Start the local model
+        if: steps.pending.outputs.versions != '[]'
+        continue-on-error: true
+        run: |
+          llama_dir="$RUNNER_TEMP/llama-$LLAMA_CPP_BUILD"
+          LD_LIBRARY_PATH="$llama_dir" nohup "$llama_dir/llama-server" \
+            --model "$RUNNER_TEMP/model.gguf" --host 127.0.0.1 --port 8080 \
+            --ctx-size 16384 --parallel 1 --reasoning off > "$RUNNER_TEMP/llama-server.log" 2>&1 &
+          for _ in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:8080/health > /dev/null 2>&1; then
+              echo "The model server is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          tail -n 60 "$RUNNER_TEMP/llama-server.log"
+          exit 1
+
+      - name: Open an issue for each release
+        if: steps.pending.outputs.versions != '[]'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSIONS: ${{ steps.pending.outputs.versions }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then extra=(--dry-run); else extra=(); fi
+          python3 .github/scripts/upstream_release_watch.py report \
+            --upstream "$UPSTREAM" --repo "$GITHUB_REPOSITORY" --versions "$VERSIONS" \
+            --model-url http://127.0.0.1:8080 --model-name "$MODEL_NAME" "${extra[@]}" |
+            tee -a "$GITHUB_STEP_SUMMARY"
