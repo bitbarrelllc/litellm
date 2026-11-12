@@ -1,3 +1,6 @@
+> [!NOTE]
+> This fork is based on upstream LiteLLM [v1.108.6](https://github.com/BerriAI/litellm/tree/v1.108.6)
+
 <h1 align="center">
         🚅 LiteLLM
     </h1>
