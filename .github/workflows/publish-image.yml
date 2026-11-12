@@ -1,0 +1,92 @@
+name: Publish image
+
+on:
+  push:
+    branches:
+      - sso-enabled
+    paths:
+      - pyproject.toml
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/publish-image.yml"
+      - ".grype.yaml"
+      - "Dockerfile"
+      - "docker/Dockerfile.mlflow"
+      - "pyproject.toml"
+      - "uv.lock"
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PUBLISH: ${{ github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch }}
+  SOURCE_IMAGE: litellm-source:${{ github.sha }}
+  BUILT_IMAGE: llmoxie-litellm:${{ github.sha }}
+
+jobs:
+  image:
+    name: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Download Grype v0.114.0
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/grype.tar.gz" \
+            https://github.com/anchore/grype/releases/download/v0.114.0/grype_0.114.0_linux_amd64.tar.gz
+          echo "edda0968d8827daab01d32b3cd7de192ae0915005e7bbfcfef9e68e79bc43343  $RUNNER_TEMP/grype.tar.gz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/grype.tar.gz" -C "$RUNNER_TEMP" grype
+          chmod +x "$RUNNER_TEMP/grype"
+
+      - name: Build the LiteLLM image from this source
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          docker build --build-arg "LITELLM_RELEASE_TAG=v$version" -t "$SOURCE_IMAGE" .
+
+      - name: Add MLflow support
+        run: |
+          docker build -f docker/Dockerfile.mlflow \
+            --build-arg "LITELLM_IMAGE=$SOURCE_IMAGE" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            -t "$BUILT_IMAGE" .
+
+      - name: Scan image for fixable HIGH/CRITICAL CVEs
+        env:
+          GRYPE_MATCH_PYTHON_USING_CPES: "true"
+        run: |
+          "$RUNNER_TEMP/grype" "$BUILT_IMAGE" \
+            --config .grype.yaml \
+            --only-fixed \
+            --fail-on high \
+            --output table
+
+      - name: Push to GHCR
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          for tag in "v$VERSION" "sha-$GITHUB_SHA"; do
+            docker tag "$BUILT_IMAGE" "$repository:$tag"
+            docker push "$repository:$tag"
+          done
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$repository:v$VERSION")
+          echo "Published \`$repository:v$VERSION\` and \`$repository:sha-$GITHUB_SHA\` as \`$digest\`" >> "$GITHUB_STEP_SUMMARY"

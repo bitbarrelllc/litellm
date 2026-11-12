@@ -44,13 +44,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Keep every other workflow switched off
+      - name: Keep the workflows this fork does not use switched off
         if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100" \
-            --jq '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/")) and .path != ".github/workflows/upstream-release-watch.yml") | "\(.id) \(.path)"' |
+            --jq '.workflows[]
+              | select(.state == "active" and (.path | startswith(".github/workflows/")))
+              | select(.path | IN(".github/workflows/upstream-release-watch.yml", ".github/workflows/publish-image.yml") | not)
+              | "\(.id) \(.path)"' |
             while read -r id path; do
               echo "Disabling $path"
               gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable" ||
