@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -56,12 +57,19 @@ class FakeGitHub:
             case ("git", "ls-remote", "--tags"):
                 return _LS_REMOTE
             case ("gh", "issue", "list"):
-                return json.dumps([{"title": title} for title in self.issue_titles])
+                return json.dumps([{"title": title} for title in self._search(command[command.index("--search") + 1])])
             case ("gh", "api", "--paginate"):
                 return "\n".join(json.dumps({"sha": sha, "message": message}) for sha, message in self.commits)
             case ("gh", "issue", "create"):
                 return "https://github.example/issues/1\n"
         raise AssertionError(f"unexpected command: {command}")
+
+    def _search(self, query: str) -> tuple[str, ...]:
+        # GitHub issue search matches a quoted phrase on whole words only: `"Upstream LiteLLM v" in:title`
+        # did not find "Upstream LiteLLM v1.108.7 is available" (observed on github.com, 2026-11-12)
+        quoted_phrase: Final = query.split('"')[1]
+        whole_words: Final = re.compile(rf"\b{re.escape(quoted_phrase)}\b")
+        return tuple(title for title in self.issue_titles if whole_words.search(title))
 
     def created_issues(self) -> tuple[tuple[str, str], ...]:
         created: Final = (call for call in self.calls if call[:3] == ("gh", "issue", "create"))

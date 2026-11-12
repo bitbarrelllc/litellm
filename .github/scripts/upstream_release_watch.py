@@ -44,7 +44,7 @@ SECURITY_HINT: Final = re.compile(
     re.IGNORECASE,
 )
 MENTION: Final = re.compile(r"@(?=\w)")
-ISSUE_TITLE_PREFIX: Final = "Upstream LiteLLM v"
+ISSUE_TITLE_SUBJECT: Final = "Upstream LiteLLM"
 PROMPT_BUDGET_CHARS: Final = 36_000
 BODY_EXCERPT_CHARS: Final = 400
 LISTED_COMMITS: Final = 200
@@ -95,7 +95,7 @@ def format_version(version: Version) -> str:
 
 
 def issue_title(version: Version) -> str:
-    return f"{ISSUE_TITLE_PREFIX}{format_version(version)} is available"
+    return f"{ISSUE_TITLE_SUBJECT} v{format_version(version)} is available"
 
 
 def newer_patch_releases(current: Version, ls_remote_output: str) -> tuple[Version, ...]:
@@ -210,7 +210,7 @@ def read_fork_version(pyproject: pathlib.Path) -> Version | None:
 def existing_issue_titles(run: Run, repo: str) -> frozenset[str]:
     listing: Final = run(
         ("gh", "issue", "list", "--repo", repo, "--state", "all", "--limit", "1000")
-        + ("--search", f'"{ISSUE_TITLE_PREFIX}" in:title', "--json", "title")
+        + ("--search", f'"{ISSUE_TITLE_SUBJECT}" in:title', "--json", "title")
     )
     return frozenset(str(issue["title"]) for issue in json.loads(listing))
 
