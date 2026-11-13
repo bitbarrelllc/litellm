@@ -82,7 +82,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          repository="ghcr.io/${GITHUB_REPOSITORY,,}-fork"
           echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           for tag in "v$VERSION" "sha-$GITHUB_SHA"; do
             docker tag "$BUILT_IMAGE" "$repository:$tag"
