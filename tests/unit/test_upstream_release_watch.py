@@ -76,20 +76,6 @@ class FakeGitHub:
         return tuple((call[call.index("--title") + 1], call[call.index("--body") + 1]) for call in created)
 
 
-@dataclass
-class FakeModel:
-    reply: bytes | None
-    requests: list[dict[str, object]] = field(default_factory=list)  # mutable-ok: records what the model was sent
-
-    def __call__(self, url: str, payload: bytes) -> bytes | None:
-        self.requests.append({"url": url, **json.loads(payload)})
-        return self.reply
-
-
-def _model_saying(text: str) -> FakeModel:
-    return FakeModel(json.dumps({"choices": [{"message": {"content": text}}]}).encode())
-
-
 def _pyproject(tmp_path: Path, version: str = "1.108.6") -> str:
     pyproject: Final = tmp_path / "pyproject.toml"
     pyproject.write_text(f'[project]\nname = "litellm"\nversion = "{version}"\n', encoding="utf-8")
@@ -100,11 +86,15 @@ def _pending(tmp_path: Path, github: FakeGitHub, *extra: str) -> tuple[str, ...]
     return ("pending", "--pyproject", _pyproject(tmp_path), "--upstream", "up/stream", "--repo", "my/fork", *extra)
 
 
-def _report(tmp_path: Path, *extra: str, versions: str = '["1.108.7"]') -> tuple[str, ...]:
+def _prompt(tmp_path: Path) -> tuple[str, ...]:
+    return ("prompt", "--pyproject", _pyproject(tmp_path), "--upstream", "up/stream", "--version", "1.108.7")
+
+
+def _report(tmp_path: Path, *extra: str, summary: str = "ok") -> tuple[str, ...]:
     return (
         "report",
         *("--pyproject", _pyproject(tmp_path), "--upstream", "up/stream", "--repo", "my/fork"),
-        *("--versions", versions, "--model-url", "http://model.test", "--model-name", "Tiny Model"),
+        *("--version", "1.108.7", "--model-name", "Tiny Model", f"--summary={summary}"),
         *extra,
     )
 
@@ -114,7 +104,7 @@ def test_pending_lists_only_newer_stable_releases_on_the_forks_release_line(
 ) -> None:
     github: Final = FakeGitHub()
 
-    code: Final = watch.main(_pending(tmp_path, github), run=github, post=FakeModel(None))
+    code: Final = watch.main(_pending(tmp_path, github), run=github)
 
     assert code == 0
     assert json.loads(capsys.readouterr().out) == ["1.108.7", "1.108.10"]
@@ -125,7 +115,7 @@ def test_pending_skips_a_release_that_already_has_an_issue_whatever_its_state(
 ) -> None:
     github: Final = FakeGitHub(issue_titles=(watch.issue_title((1, 108, 7)), "Upstream LiteLLM v1.108.1 looks odd"))
 
-    watch.main(_pending(tmp_path, github), run=github, post=FakeModel(None))
+    watch.main(_pending(tmp_path, github), run=github)
 
     assert json.loads(capsys.readouterr().out) == ["1.108.10"]
 
@@ -133,7 +123,7 @@ def test_pending_skips_a_release_that_already_has_an_issue_whatever_its_state(
 def test_pending_can_ignore_existing_issues(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     github: Final = FakeGitHub(issue_titles=(watch.issue_title((1, 108, 7)),))
 
-    watch.main(_pending(tmp_path, github, "--ignore-existing-issues"), run=github, post=FakeModel(None))
+    watch.main(_pending(tmp_path, github, "--ignore-existing-issues"), run=github)
 
     assert json.loads(capsys.readouterr().out) == ["1.108.7", "1.108.10"]
 
@@ -144,7 +134,7 @@ def test_pending_is_empty_when_the_fork_is_on_the_newest_patch(
     github: Final = FakeGitHub()
     argv: Final = ("pending", "--pyproject", _pyproject(tmp_path, "1.108.10"), "--upstream", "u/p", "--repo", "m/f")
 
-    watch.main(argv, run=github, post=FakeModel(None))
+    watch.main(argv, run=github)
 
     assert json.loads(capsys.readouterr().out) == []
 
@@ -156,18 +146,33 @@ def test_a_fork_version_that_is_not_a_release_fails_without_touching_github(
     github: Final = FakeGitHub()
     argv: Final = ("pending", "--pyproject", _pyproject(tmp_path, version), "--upstream", "u/p", "--repo", "m/f")
 
-    code: Final = watch.main(argv, run=github, post=FakeModel(None))
+    code: Final = watch.main(argv, run=github)
 
     captured: Final = capsys.readouterr()
     assert (code, captured.out, github.calls) == (1, "", [])
     assert captured.err.startswith("::error::")
 
 
+def test_prompt_prints_every_commit_message_and_the_version_range(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    github: Final = FakeGitHub()
+
+    code: Final = watch.main(_prompt(tmp_path), run=github)
+
+    prompt: Final = capsys.readouterr().out
+    assert code == 0
+    assert "v1.108.6" in prompt and "v1.108.7" in prompt
+    assert all(message.split("\n", 1)[0] in prompt for _, message in _COMMITS)
+    assert "backport #5 to the release line" in prompt
+    assert github.created_issues() == ()
+
+
 def test_report_opens_an_issue_with_the_security_commits_and_the_model_summary(tmp_path: Path) -> None:
     github: Final = FakeGitHub()
-    model: Final = _model_saying("### What changed\n- retries\n\n### Security\n- key leak closed")
+    summary_text: Final = "### What changed\n- retries\n\n### Security\n- key leak closed"
 
-    code: Final = watch.main(_report(tmp_path), run=github, post=model)
+    code: Final = watch.main(_report(tmp_path, summary=summary_text), run=github)
 
     ((title, body),) = github.created_issues()
     security, _, rest = body.partition("## Summary from the local model")
@@ -184,30 +189,11 @@ def test_report_opens_an_issue_with_the_security_commits_and_the_model_summary(t
     assert all(message.split("\n", 1)[0] in all_commits for _, message in _COMMITS)
 
 
-def test_report_sends_the_model_every_commit_message_and_the_version_range(tmp_path: Path) -> None:
-    github: Final = FakeGitHub()
-    model: Final = _model_saying("ok")
-
-    watch.main(_report(tmp_path), run=github, post=model)
-
-    (request,) = model.requests
-    prompt: Final = json.dumps(request["messages"])
-    assert request["url"] == "http://model.test/v1/chat/completions"
-    assert "v1.108.6" in prompt and "v1.108.7" in prompt
-    assert all(message.split("\n", 1)[0] in prompt for _, message in _COMMITS)
-    assert "backport #5 to the release line" in prompt
-
-
-@pytest.mark.parametrize(
-    "reply",
-    [None, b"not json", b'{"choices": []}', b'{"choices": [{"message": {"content": "   "}}]}', b'{"error": "busy"}'],
-)
-def test_report_still_opens_the_issue_and_exits_1_when_the_model_gives_no_summary(
-    tmp_path: Path, reply: bytes | None
-) -> None:
+@pytest.mark.parametrize("summary", ["", "  \n "])
+def test_report_still_opens_the_issue_and_exits_1_when_the_model_gave_no_summary(tmp_path: Path, summary: str) -> None:
     github: Final = FakeGitHub()
 
-    code: Final = watch.main(_report(tmp_path), run=github, post=FakeModel(reply))
+    code: Final = watch.main(_report(tmp_path, summary=summary), run=github)
 
     ((_, body),) = github.created_issues()
     assert code == 1
@@ -217,9 +203,8 @@ def test_report_still_opens_the_issue_and_exits_1_when_the_model_gives_no_summar
 
 def test_report_never_writes_a_live_mention_from_a_commit_or_from_the_model(tmp_path: Path) -> None:
     github: Final = FakeGitHub(commits=(("e" * 40, "fix: thanks @someone for the security report"),))
-    model: Final = _model_saying("cc @maintainers please review")
 
-    watch.main(_report(tmp_path), run=github, post=model)
+    watch.main(_report(tmp_path, summary="- cc @maintainers please review"), run=github)
 
     ((_, body),) = github.created_issues()
     assert "@someone" not in body and "@maintainers" not in body
@@ -231,7 +216,7 @@ def test_report_dry_run_prints_the_issue_and_creates_nothing(
 ) -> None:
     github: Final = FakeGitHub()
 
-    code: Final = watch.main(_report(tmp_path, "--dry-run"), run=github, post=_model_saying("all good"))
+    code: Final = watch.main(_report(tmp_path, "--dry-run", summary="all good"), run=github)
 
     out: Final = capsys.readouterr().out
     assert code == 0
@@ -239,30 +224,19 @@ def test_report_dry_run_prints_the_issue_and_creates_nothing(
     assert watch.issue_title((1, 108, 7)) in out and "all good" in out
 
 
-def test_report_opens_one_issue_per_requested_version(tmp_path: Path) -> None:
-    github: Final = FakeGitHub()
-
-    watch.main(_report(tmp_path, versions='["1.108.7", "1.108.10"]'), run=github, post=_model_saying("ok"))
-
-    assert [title for title, _ in github.created_issues()] == [
-        watch.issue_title((1, 108, 7)),
-        watch.issue_title((1, 108, 10)),
-    ]
-
-
 def test_a_release_too_large_for_the_model_is_trimmed_in_the_prompt_but_not_lost_from_the_issue(
-    tmp_path: Path,
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     commits: Final = tuple((f"{index:040x}", f"fix: change {index}\n\n" + "x" * 1000) for index in range(400))
     github: Final = FakeGitHub(commits=commits)
-    model: Final = _model_saying("ok")
 
-    watch.main(_report(tmp_path), run=github, post=model)
+    watch.main(_prompt(tmp_path), run=github)
+    watch.main(_report(tmp_path), run=github)
 
-    (request,) = model.requests
+    prompt: Final = capsys.readouterr().out
     ((_, body),) = github.created_issues()
-    assert len(json.dumps(request["messages"])) < watch.PROMPT_BUDGET_CHARS + 5000
-    assert "fix: change 0" in json.dumps(request["messages"])
+    assert len(prompt) < watch.PROMPT_BUDGET_CHARS + 500
+    assert "fix: change 0" in prompt
     assert "400 commits" in body
     assert f"and {400 - watch.LISTED_COMMITS} more" in body
     assert len(body) < 65536
